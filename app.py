@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import csv
+import io
+import math
 import tempfile
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +27,9 @@ CLASS_COLORS = {
 
 SUPPORTED_IMAGES = ["jpg", "jpeg", "png", "webp"]
 SUPPORTED_VIDEOS = ["mp4", "mov", "avi", "mkv", "webm"]
+
+TARGET_CLASSES = ["person", "car", "tree", "free_space"]
+
 
 st.set_page_config(
     page_title="Custom YOLO Predictor",
@@ -144,7 +151,13 @@ def inject_css() -> None:
           letter-spacing: -0.055em;
         }
 
-        .result-panel, .summary-panel {
+        .metric-card.car strong { color: #38bdf8; }
+        .metric-card.person strong { color: #22c55e; }
+        .metric-card.tree strong { color: #facc15; }
+        .metric-card.free strong { color: #a78bfa; }
+        .metric-card.total strong { color: #fb7185; }
+
+        .panel {
           border: 1px solid rgba(255,255,255,0.12);
           background: rgba(15, 23, 42, 0.46);
           border-radius: 24px;
@@ -152,29 +165,31 @@ def inject_css() -> None:
           margin-top: 12px;
         }
 
-        .summary-panel h3 {
+        .panel h3 {
           margin-top: 0;
           color: #f8fafc;
         }
 
-        .summary-panel p, .summary-panel li {
+        .panel p,
+        .panel li,
+        .panel small {
           color: #cbd5e1;
           line-height: 1.6;
         }
 
-        .summary-panel .risk-low {
+        .risk-low {
           color: #22c55e;
-          font-weight: 900;
+          font-weight: 950;
         }
 
-        .summary-panel .risk-medium {
+        .risk-medium {
           color: #facc15;
-          font-weight: 900;
+          font-weight: 950;
         }
 
-        .summary-panel .risk-high {
+        .risk-high {
           color: #fb7185;
-          font-weight: 900;
+          font-weight: 950;
         }
 
         .detection-row {
@@ -187,6 +202,31 @@ def inject_css() -> None:
 
         .detection-row small {
           color: #94a3b8;
+        }
+
+        .feature-grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 10px;
+          margin-top: 12px;
+        }
+
+        .feature-chip {
+          padding: 10px 12px;
+          border-radius: 14px;
+          background: rgba(2, 6, 23, 0.42);
+          border: 1px solid rgba(255,255,255,0.08);
+        }
+
+        .feature-chip small {
+          display: block;
+          color: #94a3b8;
+          font-weight: 900;
+          margin-bottom: 4px;
+        }
+
+        .feature-chip strong {
+          color: #f8fafc;
         }
 
         div[data-testid="stFileUploader"] {
@@ -258,7 +298,9 @@ def parse_yolo_result(result: Any) -> list[dict[str, Any]]:
         label = str(result.names[class_id])
 
         x1, y1, x2, y2 = [float(value) for value in box.xyxy[0].tolist()]
-        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        width = max(0.0, x2 - x1)
+        height = max(0.0, y2 - y1)
+        area = width * height
 
         detections.append(
             {
@@ -270,8 +312,8 @@ def parse_yolo_result(result: Any) -> list[dict[str, Any]]:
                     "y1": round(y1, 2),
                     "x2": round(x2, 2),
                     "y2": round(y2, 2),
-                    "width": round(x2 - x1, 2),
-                    "height": round(y2 - y1, 2),
+                    "width": round(width, 2),
+                    "height": round(height, 2),
                     "area": round(area, 2),
                 },
             }
@@ -345,30 +387,294 @@ def summarize(detections: list[dict[str, Any]]) -> dict[str, int]:
     return summary
 
 
+def extract_scene_features(
+    detections: list[dict[str, Any]],
+    image_width: int,
+    image_height: int,
+) -> dict[str, float]:
+    image_area = max(1.0, float(image_width * image_height))
+
+    counts = {
+        "car": 0.0,
+        "person": 0.0,
+        "tree": 0.0,
+        "free_space": 0.0,
+    }
+
+    areas = {
+        "car": 0.0,
+        "person": 0.0,
+        "tree": 0.0,
+        "free_space": 0.0,
+    }
+
+    confidence_sum = 0.0
+    center_activity_score = 0.0
+    largest_object_area = 0.0
+
+    center_x = image_width / 2
+    center_y = image_height / 2
+    max_distance = max(1.0, math.sqrt(center_x**2 + center_y**2))
+
+    for detection in detections:
+        label = detection["label"]
+        confidence = float(detection["confidence"])
+        box = detection["box"]
+
+        x1 = float(box["x1"])
+        y1 = float(box["y1"])
+        x2 = float(box["x2"])
+        y2 = float(box["y2"])
+
+        box_width = max(0.0, x2 - x1)
+        box_height = max(0.0, y2 - y1)
+        box_area = box_width * box_height
+
+        if label in counts:
+            counts[label] += 1.0
+            areas[label] += box_area
+
+        confidence_sum += confidence
+        largest_object_area = max(largest_object_area, box_area)
+
+        object_center_x = (x1 + x2) / 2
+        object_center_y = (y1 + y2) / 2
+
+        distance = math.sqrt(
+            (object_center_x - center_x) ** 2 + (object_center_y - center_y) ** 2
+        )
+        center_weight = 1.0 - min(distance / max_distance, 1.0)
+        center_activity_score += center_weight
+
+    total_objects = float(len(detections))
+    total_detected_area = sum(areas.values())
+    avg_confidence = confidence_sum / total_objects if total_objects else 0.0
+
+    car_person_ratio = counts["car"] / max(1.0, counts["person"])
+    green_space_ratio = areas["tree"] / max(1.0, areas["free_space"])
+
+    return {
+        "car_count": counts["car"],
+        "person_count": counts["person"],
+        "tree_count": counts["tree"],
+        "free_space_count": counts["free_space"],
+        "total_objects": total_objects,
+        "avg_confidence": avg_confidence,
+        "object_density_per_megapixel": total_objects / (image_area / 1_000_000.0),
+        "detected_area_percent": (total_detected_area / image_area) * 100.0,
+        "car_area_percent": (areas["car"] / image_area) * 100.0,
+        "person_area_percent": (areas["person"] / image_area) * 100.0,
+        "tree_area_percent": (areas["tree"] / image_area) * 100.0,
+        "free_space_area_percent": (areas["free_space"] / image_area) * 100.0,
+        "largest_object_area_percent": (largest_object_area / image_area) * 100.0,
+        "center_activity_score": center_activity_score,
+        "car_person_ratio": car_person_ratio,
+        "green_space_ratio": green_space_ratio,
+    }
+
+
+def classify_scene_from_features(features: dict[str, float]) -> dict[str, str]:
+    cars = features["car_count"]
+    persons = features["person_count"]
+    trees = features["tree_count"]
+    free_spaces = features["free_space_count"]
+    detected_area = features["detected_area_percent"]
+    avg_confidence = features["avg_confidence"]
+
+    if features["total_objects"] == 0:
+        scene_type = "empty_or_uncertain_scene"
+        explanation = "No target objects were detected."
+    elif cars >= 5 and free_spaces == 0:
+        scene_type = "crowded_parking_scene"
+        explanation = "Many cars were detected and no free-space region was found."
+    elif cars >= 3:
+        scene_type = "vehicle_dominated_scene"
+        explanation = "The scene is mainly dominated by vehicles."
+    elif persons >= 3:
+        scene_type = "human_activity_scene"
+        explanation = "Several persons were detected, suggesting human activity."
+    elif trees >= 3 and cars == 0:
+        scene_type = "green_area_scene"
+        explanation = "Tree detections dominate the scene."
+    elif free_spaces >= 1 and cars <= 2:
+        scene_type = "open_space_scene"
+        explanation = "Free-space detections suggest available open area."
+    elif detected_area > 40:
+        scene_type = "dense_object_scene"
+        explanation = "Detected objects cover a large part of the image."
+    else:
+        scene_type = "mixed_scene"
+        explanation = "The scene contains a mixed distribution of detected classes."
+
+    if avg_confidence < 0.35 and features["total_objects"] > 0:
+        reliability = "low"
+    elif avg_confidence < 0.65:
+        reliability = "medium"
+    else:
+        reliability = "high"
+
+    return {
+        "scene_type": scene_type,
+        "explanation": explanation,
+        "reliability": reliability,
+    }
+
+
+def calculate_anomaly_score(features: dict[str, float]) -> dict[str, Any]:
+    score = 0
+    reasons: list[str] = []
+
+    if features["avg_confidence"] < 0.35 and features["total_objects"] > 0:
+        score += 2
+        reasons.append("Low average confidence may indicate uncertain detections.")
+
+    if features["car_count"] >= 10:
+        score += 2
+        reasons.append("High vehicle count may indicate congestion.")
+
+    if features["person_count"] >= 5:
+        score += 2
+        reasons.append("High person count indicates increased human activity.")
+
+    if features["detected_area_percent"] > 60:
+        score += 2
+        reasons.append("Detected objects cover a large part of the image.")
+
+    if features["free_space_count"] == 0 and features["car_count"] >= 5:
+        score += 1
+        reasons.append("No free-space region was detected while several cars are present.")
+
+    if features["center_activity_score"] >= 6:
+        score += 1
+        reasons.append("Many detections are concentrated near the image center.")
+
+    if score >= 5:
+        level = "high"
+    elif score >= 2:
+        level = "medium"
+    else:
+        level = "low"
+
+    if not reasons:
+        reasons.append("No unusual pattern was detected from the available features.")
+
+    return {
+        "score": score,
+        "level": level,
+        "reasons": reasons,
+    }
+
+
+def normalize_features_for_scene_map(features: dict[str, float]) -> list[float]:
+    return [
+        min(features["car_count"] / 10.0, 1.0),
+        min(features["person_count"] / 8.0, 1.0),
+        min(features["tree_count"] / 8.0, 1.0),
+        min(features["free_space_count"] / 4.0, 1.0),
+        min(features["detected_area_percent"] / 70.0, 1.0),
+        min(features["center_activity_score"] / 8.0, 1.0),
+        features["avg_confidence"],
+    ]
+
+
+def match_som_style_scene_pattern(features: dict[str, float]) -> dict[str, Any]:
+    vector = normalize_features_for_scene_map(features)
+
+    prototypes = [
+        {
+            "name": "open_low_activity",
+            "grid": (0, 0),
+            "vector": [0.0, 0.0, 0.1, 0.8, 0.15, 0.1, 0.75],
+            "description": "Open scene with low activity and visible available space.",
+        },
+        {
+            "name": "vehicle_cluster",
+            "grid": (1, 0),
+            "vector": [0.8, 0.1, 0.1, 0.1, 0.35, 0.5, 0.75],
+            "description": "Vehicle-dominated scene with multiple cars.",
+        },
+        {
+            "name": "human_activity",
+            "grid": (2, 0),
+            "vector": [0.2, 0.8, 0.1, 0.1, 0.25, 0.6, 0.75],
+            "description": "Scene with noticeable human activity.",
+        },
+        {
+            "name": "green_area",
+            "grid": (0, 1),
+            "vector": [0.0, 0.0, 0.9, 0.2, 0.45, 0.3, 0.75],
+            "description": "Tree or vegetation dominated scene.",
+        },
+        {
+            "name": "mixed_environment",
+            "grid": (1, 1),
+            "vector": [0.4, 0.3, 0.3, 0.3, 0.35, 0.4, 0.7],
+            "description": "Mixed outdoor scene with multiple object types.",
+        },
+        {
+            "name": "crowded_or_complex",
+            "grid": (2, 1),
+            "vector": [0.9, 0.6, 0.2, 0.0, 0.65, 0.8, 0.65],
+            "description": "Crowded or complex scene with limited free space.",
+        },
+        {
+            "name": "uncertain_sparse",
+            "grid": (0, 2),
+            "vector": [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.25],
+            "description": "Sparse or uncertain scene with low detection confidence.",
+        },
+        {
+            "name": "dense_large_objects",
+            "grid": (1, 2),
+            "vector": [0.5, 0.2, 0.4, 0.2, 0.85, 0.6, 0.7],
+            "description": "Scene where detected objects cover a large image area.",
+        },
+        {
+            "name": "central_activity",
+            "grid": (2, 2),
+            "vector": [0.4, 0.4, 0.2, 0.1, 0.35, 0.95, 0.7],
+            "description": "Scene with objects concentrated near the image center.",
+        },
+    ]
+
+    best = None
+    best_distance = float("inf")
+
+    for prototype in prototypes:
+        distance = math.sqrt(
+            sum((a - b) ** 2 for a, b in zip(vector, prototype["vector"]))
+        )
+
+        if distance < best_distance:
+            best_distance = distance
+            best = prototype
+
+    confidence = max(0.0, 1.0 - best_distance / math.sqrt(len(vector)))
+
+    return {
+        "pattern": best["name"],
+        "grid": best["grid"],
+        "description": best["description"],
+        "similarity": confidence,
+        "distance": best_distance,
+    }
+
+
 def generate_ai_summary(
     detections: list[dict[str, Any]],
-    image_width: int | None = None,
-    image_height: int | None = None,
+    image_width: int,
+    image_height: int,
     media_type: str = "image",
 ) -> dict[str, Any]:
     summary = summarize(detections)
+    features = extract_scene_features(detections, image_width, image_height)
+    scene = classify_scene_from_features(features)
+    anomaly = calculate_anomaly_score(features)
+    scene_map = match_som_style_scene_pattern(features)
 
-    total = len(detections)
-    cars = summary.get("car", 0)
-    persons = summary.get("person", 0)
-    trees = summary.get("tree", 0)
-    free_spaces = summary.get("free_space", 0)
-
-    if detections:
-        avg_confidence = sum(item["confidence"] for item in detections) / len(detections)
-    else:
-        avg_confidence = 0.0
-
-    occupied_percent = None
-    if image_width and image_height and image_width > 0 and image_height > 0:
-        image_area = image_width * image_height
-        detected_area = sum(item["box"]["area"] for item in detections)
-        occupied_percent = min(100.0, (detected_area / image_area) * 100)
+    total = int(features["total_objects"])
+    avg_confidence = features["avg_confidence"]
+    occupied_percent = features["detected_area_percent"]
 
     observations: list[str] = []
 
@@ -381,130 +687,113 @@ def generate_ai_summary(
             f"The model detected {total} target object{'s' if total != 1 else ''} in this {media_type}."
         )
 
-    if cars > 0:
+    if summary["car"] > 0:
         observations.append(
-            f"{cars} car{'s were' if cars != 1 else ' was'} detected, suggesting vehicle presence or parking activity."
+            f"{summary['car']} car{'s were' if summary['car'] != 1 else ' was'} detected, suggesting vehicle presence or parking activity."
         )
 
-    if persons > 0:
+    if summary["person"] > 0:
         observations.append(
-            f"{persons} person{'s were' if persons != 1 else ' was'} detected, indicating human activity in the scene."
+            f"{summary['person']} person{'s were' if summary['person'] != 1 else ' was'} detected, indicating human activity."
         )
 
-    if trees > 0:
+    if summary["tree"] > 0:
         observations.append(
-            f"{trees} tree region{'s were' if trees != 1 else ' was'} detected, suggesting visible vegetation or green infrastructure."
+            f"{summary['tree']} tree region{'s were' if summary['tree'] != 1 else ' was'} detected, suggesting visible vegetation or green infrastructure."
         )
 
-    if free_spaces > 0:
+    if summary["free_space"] > 0:
         observations.append(
-            f"{free_spaces} free-space region{'s were' if free_spaces != 1 else ' was'} detected, which may indicate available open areas."
+            f"{summary['free_space']} free-space region{'s were' if summary['free_space'] != 1 else ' was'} detected, suggesting available open area."
         )
 
-    if occupied_percent is not None:
-        observations.append(
-            f"The detected bounding boxes cover approximately {occupied_percent:.1f}% of the image area."
-        )
+    observations.append(
+        f"The detected bounding boxes cover approximately {occupied_percent:.1f}% of the image area."
+    )
 
     if avg_confidence >= 0.75:
-        confidence_text = "The average detection confidence is high."
+        observations.append("The average detection confidence is high.")
     elif avg_confidence >= 0.45:
-        confidence_text = "The average detection confidence is moderate."
+        observations.append("The average detection confidence is moderate.")
     elif avg_confidence > 0:
-        confidence_text = "The average detection confidence is low, so the result should be reviewed carefully."
-    else:
-        confidence_text = "No confidence score is available because no objects were detected."
-
-    observations.append(confidence_text)
-
-    risk_score = 0
-
-    if persons >= 5:
-        risk_score += 2
-    elif persons >= 1:
-        risk_score += 1
-
-    if cars >= 10:
-        risk_score += 2
-    elif cars >= 3:
-        risk_score += 1
-
-    if free_spaces == 0 and (cars + persons) >= 5:
-        risk_score += 1
-
-    if avg_confidence < 0.35 and total > 0:
-        risk_score += 1
-
-    if risk_score >= 4:
-        risk_level = "high"
-        recommendation = (
-            "The scene appears crowded or complex. Manual review is recommended, especially if this is used for safety monitoring."
-        )
-    elif risk_score >= 2:
-        risk_level = "medium"
-        recommendation = (
-            "The scene shows moderate activity. Review detections and consider lowering or raising confidence depending on false positives."
+        observations.append(
+            "The average detection confidence is low, so the result should be reviewed carefully."
         )
     else:
-        risk_level = "low"
+        observations.append("No confidence score is available because no objects were detected.")
+
+    observations.append(
+        f"The SOM-style scene map matched this image to the '{scene_map['pattern']}' pattern."
+    )
+
+    if anomaly["level"] == "high":
         recommendation = (
-            "The scene appears relatively simple based on the detected objects."
+            "Manual review is strongly recommended because the scene appears complex or unusual."
+        )
+    elif anomaly["level"] == "medium":
+        recommendation = (
+            "Manual review is recommended, especially if this image is used for monitoring or decision support."
+        )
+    else:
+        recommendation = (
+            "The scene appears relatively simple based on the current detections."
         )
 
     if total == 0:
-        risk_level = "low"
         recommendation = (
             "Try lowering the confidence threshold or uploading a clearer image if objects are expected."
         )
 
     return {
         "summary": summary,
-        "total": total,
-        "average_confidence": avg_confidence,
-        "occupied_percent": occupied_percent,
+        "features": features,
+        "scene": scene,
+        "anomaly": anomaly,
+        "scene_map": scene_map,
         "observations": observations,
-        "risk_level": risk_level,
         "recommendation": recommendation,
     }
 
 
-def render_ai_summary(ai_summary: dict[str, Any]) -> None:
-    risk_level = ai_summary["risk_level"]
-    risk_class = {
-        "low": "risk-low",
-        "medium": "risk-medium",
-        "high": "risk-high",
-    }.get(risk_level, "risk-medium")
+def detections_to_csv(detections: list[dict[str, Any]]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
 
-    observations_html = "".join(
-        f"<li>{observation}</li>" for observation in ai_summary["observations"]
+    writer.writerow(
+        [
+            "index",
+            "class_id",
+            "label",
+            "confidence",
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+            "width",
+            "height",
+            "area",
+        ]
     )
 
-    avg_conf = ai_summary["average_confidence"] * 100
+    for index, detection in enumerate(detections, start=1):
+        box = detection["box"]
+        writer.writerow(
+            [
+                index,
+                detection["class_id"],
+                detection["label"],
+                round(detection["confidence"], 5),
+                box["x1"],
+                box["y1"],
+                box["x2"],
+                box["y2"],
+                box["width"],
+                box["height"],
+                box["area"],
+            ]
+        )
 
-    occupied = ai_summary["occupied_percent"]
-    occupied_text = "N/A" if occupied is None else f"{occupied:.1f}%"
-
-    st.markdown(
-        f"""
-        <div class="summary-panel">
-          <h3>🤖 AI Scene Summary</h3>
-          <p>
-            <strong>Risk / complexity level:</strong>
-            <span class="{risk_class}">{risk_level.upper()}</span>
-          </p>
-          <p>
-            <strong>Average confidence:</strong> {avg_conf:.1f}%<br>
-            <strong>Approximate detected area:</strong> {occupied_text}
-          </p>
-          <ul>
-            {observations_html}
-          </ul>
-          <p><strong>Recommendation:</strong> {ai_summary["recommendation"]}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    return buffer.getvalue().encode("utf-8")
 
 
 def render_hero(model: YOLO) -> None:
@@ -518,13 +807,13 @@ def render_hero(model: YOLO) -> None:
             <section class="hero glass">
               <div class="badge">🔨🤖🔧 Custom Trained YOLO Predictor</div>
               <h1>
-                Predict & visualize
-                <span>cars, people, trees, free space</span>
+                Predict, visualize
+                <span>and understand scenes</span>
               </h1>
               <p>
-                Upload an image or video. Your trained <b>best.pt</b> model runs inside Streamlit,
-                then this dashboard visualizes detections, confidence scores, counts,
-                and an automatic AI-style scene summary.
+                Upload an image or video. Your trained <b>best.pt</b> YOLO11 model runs inside Streamlit,
+                then this dashboard visualizes detections, bounding boxes, AI scene summaries,
+                feature analytics, anomaly scores, and SOM-style scene patterns.
               </p>
             </section>
             """,
@@ -538,7 +827,7 @@ def render_hero(model: YOLO) -> None:
               <div class="status-dot"></div>
               <div>
                 <strong>Model ready</strong><br>
-                <small>Classes: {names}</small>
+                <small>Classes: {escape(names)}</small>
               </div>
             </div>
             """,
@@ -564,12 +853,109 @@ def render_metrics(summary: dict[str, int]) -> None:
             st.markdown(
                 f"""
                 <div class="metric-card {css_class}">
-                  <small>{label}</small>
+                  <small>{escape(label)}</small>
                   <strong>{value}</strong>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+
+
+def render_ai_summary(ai_summary: dict[str, Any]) -> None:
+    anomaly = ai_summary["anomaly"]
+    scene = ai_summary["scene"]
+    scene_map = ai_summary["scene_map"]
+    features = ai_summary["features"]
+
+    risk_level = anomaly["level"]
+    risk_class = {
+        "low": "risk-low",
+        "medium": "risk-medium",
+        "high": "risk-high",
+    }.get(risk_level, "risk-medium")
+
+    observations_html = "".join(
+        f"<li>{escape(observation)}</li>" for observation in ai_summary["observations"]
+    )
+
+    reasons_html = "".join(
+        f"<li>{escape(reason)}</li>" for reason in anomaly["reasons"]
+    )
+
+    st.markdown(
+        f"""
+        <div class="panel">
+          <h3>🤖 AI Scene Intelligence</h3>
+
+          <p>
+            <strong>Scene type:</strong> {escape(scene["scene_type"])}<br>
+            <strong>Scene explanation:</strong> {escape(scene["explanation"])}<br>
+            <strong>Reliability:</strong> {escape(scene["reliability"]).upper()}
+          </p>
+
+          <p>
+            <strong>Anomaly / complexity level:</strong>
+            <span class="{risk_class}">{escape(risk_level).upper()}</span>
+            &nbsp; | &nbsp;
+            <strong>Anomaly score:</strong> {anomaly["score"]}
+          </p>
+
+          <p>
+            <strong>SOM-style pattern:</strong> {escape(scene_map["pattern"])}<br>
+            <strong>Pattern grid position:</strong> {scene_map["grid"]}<br>
+            <strong>Pattern similarity:</strong> {scene_map["similarity"] * 100:.1f}%<br>
+            <strong>Pattern meaning:</strong> {escape(scene_map["description"])}
+          </p>
+
+          <ul>{observations_html}</ul>
+
+          <p><strong>Anomaly reasons:</strong></p>
+          <ul>{reasons_html}</ul>
+
+          <p><strong>Recommendation:</strong> {escape(ai_summary["recommendation"])}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    render_feature_panel(features)
+
+
+def render_feature_panel(features: dict[str, float]) -> None:
+    chips = [
+        ("Avg confidence", f"{features['avg_confidence'] * 100:.1f}%"),
+        ("Detected area", f"{features['detected_area_percent']:.1f}%"),
+        ("Object density", f"{features['object_density_per_megapixel']:.2f}/MP"),
+        ("Center activity", f"{features['center_activity_score']:.2f}"),
+        ("Car area", f"{features['car_area_percent']:.1f}%"),
+        ("Person area", f"{features['person_area_percent']:.1f}%"),
+        ("Tree area", f"{features['tree_area_percent']:.1f}%"),
+        ("Free-space area", f"{features['free_space_area_percent']:.1f}%"),
+        ("Largest object", f"{features['largest_object_area_percent']:.1f}%"),
+        ("Car/person ratio", f"{features['car_person_ratio']:.2f}"),
+    ]
+
+    chips_html = ""
+
+    for label, value in chips:
+        chips_html += f"""
+        <div class="feature-chip">
+          <small>{escape(label)}</small>
+          <strong>{escape(value)}</strong>
+        </div>
+        """
+
+    st.markdown(
+        f"""
+        <div class="panel">
+          <h3>📊 Extracted Scene Features</h3>
+          <div class="feature-grid">
+            {chips_html}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_detections(detections: list[dict[str, Any]]) -> None:
@@ -578,7 +964,7 @@ def render_detections(detections: list[dict[str, Any]]) -> None:
     if not detections:
         st.markdown(
             """
-            <div class="result-panel">
+            <div class="panel">
               No detections. Try lowering confidence or use a clearer image.
             </div>
             """,
@@ -593,18 +979,19 @@ def render_detections(detections: list[dict[str, Any]]) -> None:
 
         rows_html += f"""
         <div class="detection-row">
-          <strong>#{index} {detection["label"]}</strong>
+          <strong>#{index} {escape(detection["label"])}</strong>
           <span style="float:right;">{detection["confidence"] * 100:.1f}%</span><br>
           <small>
             x1: {box["x1"]}, y1: {box["y1"]}<br>
-            width: {box["width"]}, height: {box["height"]}
+            width: {box["width"]}, height: {box["height"]}<br>
+            area: {box["area"]}
           </small>
         </div>
         """
 
     st.markdown(
         f"""
-        <div class="result-panel">
+        <div class="panel">
           {rows_html}
         </div>
         """,
@@ -640,7 +1027,7 @@ def process_video(
     confidence: float,
     image_size: int,
     frame_skip: int,
-) -> tuple[Path, dict[str, int], int]:
+) -> tuple[Path, dict[str, int], dict[str, Any]]:
     suffix = Path(uploaded_file.name).suffix.lower()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as input_file:
@@ -676,6 +1063,9 @@ def process_video(
         "free_space": 0,
     }
 
+    total_detections = 0
+    confidence_sum = 0.0
+
     progress = st.progress(0)
     status = st.empty()
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
@@ -702,6 +1092,10 @@ def process_video(
             for key, value in frame_summary.items():
                 global_summary[key] += value
 
+            for detection in latest_detections:
+                total_detections += 1
+                confidence_sum += float(detection["confidence"])
+
             processed_frames += 1
 
         annotated = draw_detections(frame, latest_detections)
@@ -717,7 +1111,66 @@ def process_video(
     progress.empty()
     status.empty()
 
-    return output_path, global_summary, processed_frames
+    video_stats = {
+        "processed_frames": processed_frames,
+        "total_frames": frame_index,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "total_detections": total_detections,
+        "average_confidence": confidence_sum / total_detections if total_detections else 0.0,
+    }
+
+    return output_path, global_summary, video_stats
+
+
+def render_video_summary(summary: dict[str, int], stats: dict[str, Any], frame_skip: int) -> None:
+    total_objects = sum(summary.values())
+
+    if total_objects >= 50:
+        risk_level = "high"
+    elif total_objects >= 10:
+        risk_level = "medium"
+    else:
+        risk_level = "low"
+
+    risk_class = {
+        "low": "risk-low",
+        "medium": "risk-medium",
+        "high": "risk-high",
+    }[risk_level]
+
+    st.markdown(
+        f"""
+        <div class="panel">
+          <h3>🎞️ Video AI Summary</h3>
+          <p>
+            <strong>Processed frames:</strong> {stats["processed_frames"]}<br>
+            <strong>Total frames read:</strong> {stats["total_frames"]}<br>
+            <strong>Frame skip:</strong> {frame_skip}<br>
+            <strong>Video size:</strong> {stats["width"]} × {stats["height"]}<br>
+            <strong>FPS:</strong> {stats["fps"]:.2f}
+          </p>
+          <p>
+            <strong>Total detections across processed frames:</strong> {total_objects}<br>
+            <strong>Average detection confidence:</strong> {stats["average_confidence"] * 100:.1f}%<br>
+            <strong>Video activity level:</strong>
+            <span class="{risk_class}">{risk_level.upper()}</span>
+          </p>
+          <ul>
+            <li>Cars detected across frames: {summary.get("car", 0)}</li>
+            <li>Persons detected across frames: {summary.get("person", 0)}</li>
+            <li>Trees detected across frames: {summary.get("tree", 0)}</li>
+            <li>Free-space regions detected across frames: {summary.get("free_space", 0)}</li>
+          </ul>
+          <p>
+            <strong>Recommendation:</strong>
+            Use a lower frame skip for more detailed temporal analysis, or a higher frame skip for faster processing.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_empty_state() -> None:
@@ -797,12 +1250,20 @@ def main() -> None:
 
             render_metrics(summary)
 
-            left, right = st.columns([1.7, 1])
+            left, right = st.columns([1.6, 1])
 
             with left:
                 st.image(
                     annotated_image,
                     caption="Annotated result",
+                    use_container_width=True,
+                )
+
+                st.download_button(
+                    label="Download detections CSV",
+                    data=detections_to_csv(detections),
+                    file_name="detections.csv",
+                    mime="text/csv",
                     use_container_width=True,
                 )
 
@@ -823,7 +1284,7 @@ def main() -> None:
 
         if st.button("Predict Video", use_container_width=True):
             with st.spinner("Processing video. This may take time on free CPU..."):
-                output_path, summary, processed_frames = process_video(
+                output_path, summary, stats = process_video(
                     model=model,
                     uploaded_file=uploaded_file,
                     confidence=confidence,
@@ -832,28 +1293,9 @@ def main() -> None:
                 )
 
             render_metrics(summary)
+            render_video_summary(summary, stats, frame_skip)
 
-            video_ai_summary = {
-                "risk_level": "medium" if sum(summary.values()) > 0 else "low",
-                "average_confidence": 0.0,
-                "occupied_percent": None,
-                "observations": [
-                    f"The video was processed using frame skip {frame_skip}.",
-                    f"The model processed {processed_frames} frames for object detection.",
-                    f"Detected object totals across processed frames: "
-                    f"{summary.get('car', 0)} cars, "
-                    f"{summary.get('person', 0)} persons, "
-                    f"{summary.get('tree', 0)} trees, "
-                    f"{summary.get('free_space', 0)} free-space regions.",
-                ],
-                "recommendation": (
-                    "Review the annotated video and use a lower frame skip for more detailed temporal analysis."
-                ),
-            }
-
-            render_ai_summary(video_ai_summary)
-
-            st.success(f"Video processed. Frames with prediction: {processed_frames}")
+            st.success(f"Video processed. Frames with prediction: {stats['processed_frames']}")
 
             video_bytes = output_path.read_bytes()
             st.video(video_bytes)
