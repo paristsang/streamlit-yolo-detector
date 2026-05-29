@@ -1,5 +1,12 @@
+<<<<<<< HEAD
 streamlit>=1.38.0
 ultralytics>=8.3.0,<8.5.0
 opencv-python-headless>=4.8.0,<4.13.0
 numpy>=1.26.0,<2.0.0
+=======
+streamlit>=1.38.0
+ultralytics>=8.3.0,<8.5.0
+opencv-python-headless>=4.8.0,<4.13.0
+numpy>=1.26.0,<2.0.0
+>>>>>>> cfd6602c5245d518f4635e8ededf8550c087d7c8
 pillow>=10.0.0
