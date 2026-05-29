@@ -144,18 +144,37 @@ def inject_css() -> None:
           letter-spacing: -0.055em;
         }
 
-        .metric-card.car strong { color: #38bdf8; }
-        .metric-card.person strong { color: #22c55e; }
-        .metric-card.tree strong { color: #facc15; }
-        .metric-card.free strong { color: #a78bfa; }
-        .metric-card.total strong { color: #fb7185; }
-
-        .result-panel {
+        .result-panel, .summary-panel {
           border: 1px solid rgba(255,255,255,0.12);
           background: rgba(15, 23, 42, 0.46);
           border-radius: 24px;
           padding: 18px;
           margin-top: 12px;
+        }
+
+        .summary-panel h3 {
+          margin-top: 0;
+          color: #f8fafc;
+        }
+
+        .summary-panel p, .summary-panel li {
+          color: #cbd5e1;
+          line-height: 1.6;
+        }
+
+        .summary-panel .risk-low {
+          color: #22c55e;
+          font-weight: 900;
+        }
+
+        .summary-panel .risk-medium {
+          color: #facc15;
+          font-weight: 900;
+        }
+
+        .summary-panel .risk-high {
+          color: #fb7185;
+          font-weight: 900;
         }
 
         .detection-row {
@@ -239,6 +258,7 @@ def parse_yolo_result(result: Any) -> list[dict[str, Any]]:
         label = str(result.names[class_id])
 
         x1, y1, x2, y2 = [float(value) for value in box.xyxy[0].tolist()]
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
         detections.append(
             {
@@ -252,6 +272,7 @@ def parse_yolo_result(result: Any) -> list[dict[str, Any]]:
                     "y2": round(y2, 2),
                     "width": round(x2 - x1, 2),
                     "height": round(y2 - y1, 2),
+                    "area": round(area, 2),
                 },
             }
         )
@@ -324,6 +345,168 @@ def summarize(detections: list[dict[str, Any]]) -> dict[str, int]:
     return summary
 
 
+def generate_ai_summary(
+    detections: list[dict[str, Any]],
+    image_width: int | None = None,
+    image_height: int | None = None,
+    media_type: str = "image",
+) -> dict[str, Any]:
+    summary = summarize(detections)
+
+    total = len(detections)
+    cars = summary.get("car", 0)
+    persons = summary.get("person", 0)
+    trees = summary.get("tree", 0)
+    free_spaces = summary.get("free_space", 0)
+
+    if detections:
+        avg_confidence = sum(item["confidence"] for item in detections) / len(detections)
+    else:
+        avg_confidence = 0.0
+
+    occupied_percent = None
+    if image_width and image_height and image_width > 0 and image_height > 0:
+        image_area = image_width * image_height
+        detected_area = sum(item["box"]["area"] for item in detections)
+        occupied_percent = min(100.0, (detected_area / image_area) * 100)
+
+    observations: list[str] = []
+
+    if total == 0:
+        observations.append(
+            "No target objects were detected. The scene may be empty, unclear, or below the selected confidence threshold."
+        )
+    else:
+        observations.append(
+            f"The model detected {total} target object{'s' if total != 1 else ''} in this {media_type}."
+        )
+
+    if cars > 0:
+        observations.append(
+            f"{cars} car{'s were' if cars != 1 else ' was'} detected, suggesting vehicle presence or parking activity."
+        )
+
+    if persons > 0:
+        observations.append(
+            f"{persons} person{'s were' if persons != 1 else ' was'} detected, indicating human activity in the scene."
+        )
+
+    if trees > 0:
+        observations.append(
+            f"{trees} tree region{'s were' if trees != 1 else ' was'} detected, suggesting visible vegetation or green infrastructure."
+        )
+
+    if free_spaces > 0:
+        observations.append(
+            f"{free_spaces} free-space region{'s were' if free_spaces != 1 else ' was'} detected, which may indicate available open areas."
+        )
+
+    if occupied_percent is not None:
+        observations.append(
+            f"The detected bounding boxes cover approximately {occupied_percent:.1f}% of the image area."
+        )
+
+    if avg_confidence >= 0.75:
+        confidence_text = "The average detection confidence is high."
+    elif avg_confidence >= 0.45:
+        confidence_text = "The average detection confidence is moderate."
+    elif avg_confidence > 0:
+        confidence_text = "The average detection confidence is low, so the result should be reviewed carefully."
+    else:
+        confidence_text = "No confidence score is available because no objects were detected."
+
+    observations.append(confidence_text)
+
+    risk_score = 0
+
+    if persons >= 5:
+        risk_score += 2
+    elif persons >= 1:
+        risk_score += 1
+
+    if cars >= 10:
+        risk_score += 2
+    elif cars >= 3:
+        risk_score += 1
+
+    if free_spaces == 0 and (cars + persons) >= 5:
+        risk_score += 1
+
+    if avg_confidence < 0.35 and total > 0:
+        risk_score += 1
+
+    if risk_score >= 4:
+        risk_level = "high"
+        recommendation = (
+            "The scene appears crowded or complex. Manual review is recommended, especially if this is used for safety monitoring."
+        )
+    elif risk_score >= 2:
+        risk_level = "medium"
+        recommendation = (
+            "The scene shows moderate activity. Review detections and consider lowering or raising confidence depending on false positives."
+        )
+    else:
+        risk_level = "low"
+        recommendation = (
+            "The scene appears relatively simple based on the detected objects."
+        )
+
+    if total == 0:
+        risk_level = "low"
+        recommendation = (
+            "Try lowering the confidence threshold or uploading a clearer image if objects are expected."
+        )
+
+    return {
+        "summary": summary,
+        "total": total,
+        "average_confidence": avg_confidence,
+        "occupied_percent": occupied_percent,
+        "observations": observations,
+        "risk_level": risk_level,
+        "recommendation": recommendation,
+    }
+
+
+def render_ai_summary(ai_summary: dict[str, Any]) -> None:
+    risk_level = ai_summary["risk_level"]
+    risk_class = {
+        "low": "risk-low",
+        "medium": "risk-medium",
+        "high": "risk-high",
+    }.get(risk_level, "risk-medium")
+
+    observations_html = "".join(
+        f"<li>{observation}</li>" for observation in ai_summary["observations"]
+    )
+
+    avg_conf = ai_summary["average_confidence"] * 100
+
+    occupied = ai_summary["occupied_percent"]
+    occupied_text = "N/A" if occupied is None else f"{occupied:.1f}%"
+
+    st.markdown(
+        f"""
+        <div class="summary-panel">
+          <h3>🤖 AI Scene Summary</h3>
+          <p>
+            <strong>Risk / complexity level:</strong>
+            <span class="{risk_class}">{risk_level.upper()}</span>
+          </p>
+          <p>
+            <strong>Average confidence:</strong> {avg_conf:.1f}%<br>
+            <strong>Approximate detected area:</strong> {occupied_text}
+          </p>
+          <ul>
+            {observations_html}
+          </ul>
+          <p><strong>Recommendation:</strong> {ai_summary["recommendation"]}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_hero(model: YOLO) -> None:
     names = ", ".join(str(name) for name in model.names.values())
 
@@ -340,8 +523,8 @@ def render_hero(model: YOLO) -> None:
               </h1>
               <p>
                 Upload an image or video. Your trained <b>best.pt</b> model runs inside Streamlit,
-                then this dashboard visualizes detections with boxes, confidence scores,
-                counts, and downloadable results.
+                then this dashboard visualizes detections, confidence scores, counts,
+                and an automatic AI-style scene summary.
               </p>
             </section>
             """,
@@ -390,7 +573,7 @@ def render_metrics(summary: dict[str, int]) -> None:
 
 
 def render_detections(detections: list[dict[str, Any]]) -> None:
-    st.markdown("### Results")
+    st.markdown("### Detections")
 
     if not detections:
         st.markdown(
@@ -605,6 +788,13 @@ def main() -> None:
                 )
 
             summary = summarize(detections)
+            ai_summary = generate_ai_summary(
+                detections=detections,
+                image_width=image.width,
+                image_height=image.height,
+                media_type="image",
+            )
+
             render_metrics(summary)
 
             left, right = st.columns([1.7, 1])
@@ -617,7 +807,9 @@ def main() -> None:
                 )
 
             with right:
+                render_ai_summary(ai_summary)
                 render_detections(detections)
+
         else:
             render_metrics(initial_summary)
             st.image(
@@ -640,6 +832,27 @@ def main() -> None:
                 )
 
             render_metrics(summary)
+
+            video_ai_summary = {
+                "risk_level": "medium" if sum(summary.values()) > 0 else "low",
+                "average_confidence": 0.0,
+                "occupied_percent": None,
+                "observations": [
+                    f"The video was processed using frame skip {frame_skip}.",
+                    f"The model processed {processed_frames} frames for object detection.",
+                    f"Detected object totals across processed frames: "
+                    f"{summary.get('car', 0)} cars, "
+                    f"{summary.get('person', 0)} persons, "
+                    f"{summary.get('tree', 0)} trees, "
+                    f"{summary.get('free_space', 0)} free-space regions.",
+                ],
+                "recommendation": (
+                    "Review the annotated video and use a lower frame skip for more detailed temporal analysis."
+                ),
+            }
+
+            render_ai_summary(video_ai_summary)
+
             st.success(f"Video processed. Frames with prediction: {processed_frames}")
 
             video_bytes = output_path.read_bytes()
