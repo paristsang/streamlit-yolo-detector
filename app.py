@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 from __future__ import annotations
 
 import tempfile
@@ -1294,5 +1293,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
->>>>>>> cfd6602c5245d518f4635e8ededf8550c087d7c8
     main()
