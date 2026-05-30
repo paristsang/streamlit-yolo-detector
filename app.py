@@ -328,6 +328,13 @@ def draw_detections(
 ) -> np.ndarray:
     output = frame_bgr.copy()
 
+    # Smaller visual style
+    box_thickness = 1
+    font_scale = 0.42
+    font_thickness = 1
+    label_padding_x = 5
+    label_padding_y = 4
+
     for detection in detections:
         label = detection["label"]
         confidence = detection["confidence"]
@@ -341,29 +348,54 @@ def draw_detections(
         color = get_color(label)
         text = f"{label} {confidence * 100:.1f}%"
 
-        cv2.rectangle(output, (x1, y1), (x2, y2), color, 3)
+        cv2.rectangle(
+            output,
+            (x1, y1),
+            (x2, y2),
+            color,
+            box_thickness,
+        )
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        text_size, _ = cv2.getTextSize(text, font, 0.65, 2)
+        text_size, baseline = cv2.getTextSize(
+            text,
+            font,
+            font_scale,
+            font_thickness,
+        )
+
         text_w, text_h = text_size
-        y_label_top = max(0, y1 - text_h - 14)
+
+        label_w = text_w + label_padding_x * 2
+        label_h = text_h + label_padding_y * 2 + baseline
+
+        y_label_top = max(0, y1 - label_h)
+        y_label_bottom = y1
+
+        # If box is too close to the top, draw label inside the box
+        if y_label_top <= 0:
+            y_label_top = y1
+            y_label_bottom = min(output.shape[0], y1 + label_h)
 
         cv2.rectangle(
             output,
             (x1, y_label_top),
-            (x1 + text_w + 14, y1),
+            (min(x1 + label_w, output.shape[1] - 1), y_label_bottom),
             color,
             -1,
         )
 
+        text_x = x1 + label_padding_x
+        text_y = y_label_bottom - label_padding_y - baseline
+
         cv2.putText(
             output,
             text,
-            (x1 + 7, max(18, y1 - 8)),
+            (text_x, text_y),
             font,
-            0.65,
+            font_scale,
             (2, 6, 23),
-            2,
+            font_thickness,
             cv2.LINE_AA,
         )
 
